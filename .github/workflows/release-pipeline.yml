@@ -1,0 +1,321 @@
+name: Release Pipeline
+
+on:
+  push:
+    branches: [develop, main]
+    paths-ignore: ['ci/**']
+  pull_request:
+    branches: [develop]
+    paths-ignore: ['ci/**']
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: false
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+      release_type:
+        description: 'Release type'
+        required: true
+        type: choice
+        options:
+          - release
+          - pre-release
+          - none
+        default: 'none'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  build-kit:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.new_version }}
+      previous_version: ${{ steps.version.outputs.previous_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - id: version
+        uses: ./.github/actions/version-manager
+        with:
+          bump_type: ${{ inputs.version_bump || env.VERSION_DEFAULT }}
+          
+      - name: Push version change
+        run: |
+          git push origin HEAD
+          git tag "v${{ steps.version.outputs.new_version }}"
+          git push origin "v${{ steps.version.outputs.new_version }}"
+          
+      - name: Build Kit
+        env:
+          GENESIS_SECRETS_BASE: ${{ secrets.SECRETS_BASE }}
+          GENESIS_SECRETS_TOKEN: ${{ secrets.SECRETS_TOKEN }}
+          GENESIS_SECRETS_KEY: ${{ secrets.SECRETS_KEY }}
+          BOSH_CLIENT: ${{ secrets.BOSH_CLIENT }}
+          BOSH_CLIENT_SECRET: ${{ secrets.BOSH_CLIENT_SECRET }}
+          BOSH_ENVIRONMENT: ${{ secrets.BOSH_ENVIRONMENT }}
+          BOSH_CA_CERT: ${{ secrets.BOSH_CA_CERT }}
+          KIT_VERSION: ${{ steps.version.outputs.new_version }}
+          BUILD_ROOT: "build"
+        run: |
+          sudo chmod -R a+rwx ./*
+          ./ci/scripts/ensure-tools.sh
+          
+          genesis compile-kit --force -v "$KIT_VERSION" -n "${{ env.KIT_NAME }}"
+          sudo mkdir -p ${{ env.BUILD_ROOT }}/
+          sudo chmod -R a+rwx ${{ env.BUILD_ROOT }}/
+          cp ./${{ env.KIT_NAME }}-${{ steps.version.outputs.new_version }}.tar.gz ${{ env.BUILD_ROOT }}/
+          ls -lah ${{ env.BUILD_ROOT }}/
+          echo "Build completed successfully"
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kit-build
+          path: ${{ env.KIT_NAME }}-${{ steps.version.outputs.new_version }}.tar.gz
+
+  spec-tests:
+    needs: [build-kit]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-build
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - name: Run Spec Tests
+        env:
+          GENESIS_SECRETS_BASE: ${{ secrets.SECRETS_BASE }}
+          GENESIS_SECRETS_TOKEN: ${{ secrets.SECRETS_TOKEN }}
+          GENESIS_SECRETS_KEY: ${{ secrets.SECRETS_KEY }}
+          KIT_VERSION: ${{ needs.build-kit.outputs.version }}
+        run: |
+          sudo chmod -R a+rwx ./*
+          ./ci/scripts/ensure-tools.sh
+
+          sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf ${{ env.GO_VERSION }}
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          export PATH=$PATH:~/go/bin
+          
+          cd spec
+          ginkgo ${{ env.GINKGO_PARAMS }} .
+
+  spec-check:
+    needs: [build-kit]
+    runs-on: ubuntu-latest
+    outputs:
+      has_breaking_changes: ${{ steps.check-breaking.outputs.has_breaking_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - name: Check Specs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_VERSION: ${{ needs.build-kit.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.build-kit.outputs.previous_version }}
+        run: |
+          sudo chmod -R a+rwx ./*
+          ./ci/scripts/ensure-tools.sh
+
+          sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf ${{ env.GO_VERSION }}
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          export PATH=$PATH:~/go/bin
+
+          mkdir -p ${{ env.SPEC_CHECK_DIR }}
+          
+          # Get the most recent tag
+          git fetch --tags
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          if [[ -n "$PREV_TAG" ]]; then
+            echo "Found previous tag: $PREV_TAG"
+            git checkout $PREV_TAG
+            cp -r spec/results ./${{ env.SPEC_CHECK_DIR }}/old-specs
+            git checkout -
+          fi
+          
+          cd spec
+          ginkgo ${{ env.GINKGO_PARAMS }} .
+          cd ..
+          
+          results_file="${GITHUB_WORKSPACE}/${{ env.SPEC_CHECK_DIR }}/diff-$(date -u +%Y%m%d%H%M%S)"
+          if [[ -n "$PREV_TAG" ]]; then
+            echo "Comparing specs with previous release $PREV_TAG" > "$results_file"
+            ./ci/scripts/compare-release-specs.sh "$PREV_TAG" >> "$results_file"
+          else
+            echo "Initial release - no spec changes to compare" > "$results_file"
+          fi
+
+      - id: check-breaking
+        run: |
+          if grep -q "BREAKING CHANGE" ${{ env.SPEC_CHECK_DIR }}/diff-*; then
+            echo "has_breaking_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_breaking_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spec-diffs
+          path: ${{ env.SPEC_CHECK_DIR }}/*
+
+  deploy:
+    needs: [spec-tests, spec-check, build-kit]
+    runs-on: ubuntu-latest
+    environment: ${{ vars.TEST_ENVIRONMENT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-build
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - name: Set up Infrastructure
+        uses: ./.github/actions/setup-infra
+        with:
+          iaas: ${{ env.IAAS_PROVIDER }}
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          gcp_service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          vsphere_username: ${{ secrets.VSPHERE_USERNAME }}
+          vsphere_password: ${{ secrets.VSPHERE_PASSWORD }}
+          
+      - name: Deploy and Test
+        env:
+          DEPLOY_ENV: ${{ env.DEPLOY_ENV }}
+          CI_ROOT: ${{ github.workspace }}/git-ci
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          GENESIS_SECRETS_BASE: ${{ secrets.SECRETS_BASE }}
+          GENESIS_SECRETS_TOKEN: ${{ secrets.SECRETS_TOKEN }}
+          GENESIS_SECRETS_KEY: ${{ secrets.SECRETS_KEY }}
+          GENESIS_STACK_TRACE: "yes"
+          BOSH_CLIENT: ${{ secrets.BOSH_CLIENT }}
+          BOSH_CLIENT_SECRET: ${{ secrets.BOSH_CLIENT_SECRET }}
+          BOSH_ENVIRONMENT: ${{ secrets.BOSH_ENVIRONMENT }}
+          BOSH_CA_CERT: ${{ secrets.BOSH_CA_CERT }}
+          SECRETS_SEED_DATA: ${{ secrets.SECRETS_SEED_DATA }}
+          KIT_VERSION: ${{ needs.build-kit.outputs.version }}
+          KIT_SHORTNAME: "shield"
+          BUILD_ROOT: "build"
+        run: |
+          sudo mkdir -p ${{ env.BUILD_ROOT }}/
+          sudo chmod -R a+rwx ${{ env.BUILD_ROOT }}/
+          sudo cp $GITHUB_WORKSPACE/${{ env.KIT_NAME }}-${{ needs.build-kit.outputs.version }}.tar.gz ${{ env.BUILD_ROOT }}/
+          sudo chmod -R a+rwx ./**
+          sudo mkdir -p ./git-ci/ci/
+          sudo chmod a+rwx ./git-ci/ci/
+          cp -r ./ci/* ./git-ci/ci/
+          ls -lah ./git-ci/ci/scripts/
+          ./ci/scripts/ensure-tools.sh
+          ./ci/scripts/init-vault.sh
+          ./ci/scripts/deploy.sh
+
+  prepare-release:
+    if: github.ref == 'refs/heads/develop' && github.event_name != 'pull_request'
+    needs: [deploy, build-kit, spec-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spec-diffs
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - name: Generate Release Notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_VERSION: ${{ needs.build-kit.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.build-kit.outputs.previous_version }}
+          HAS_BREAKING_CHANGES: ${{ needs.spec-check.outputs.has_breaking_changes }}
+        run: |
+          ./ci/scripts/generate-release-notes.sh \
+            "$CURRENT_VERSION" \
+            "$PREVIOUS_VERSION" \
+            "${{ env.RELEASE_NOTES_FILE }}"
+            
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.RELEASE_BRANCH_PREFIX }}${{ needs.build-kit.outputs.version }}
+          title: Release v${{ needs.build-kit.outputs.version }}
+          body: |
+            Release preparation for version ${{ needs.build-kit.outputs.version }}
+            Previous version: ${{ needs.build-kit.outputs.previous_version }}
+            ${{ needs.spec-check.outputs.has_breaking_changes == 'true' && '⚠️ Contains breaking changes!' || '' }}
+            
+            Generated release notes and spec diffs attached.
+          labels: ${{ env.PR_LABELS }}${{ needs.spec-check.outputs.has_breaking_changes == 'true' && ',breaking-change' || '' }}
+          base: ${{ env.BASE_BRANCH }}
+
+  release:
+    # Run on main branch OR when manually triggered with release/pre-release type
+    if: |
+      github.ref == 'refs/heads/main' || 
+      (github.event_name == 'workflow_dispatch' && inputs.release_type != 'none')
+    needs: [deploy, build-kit, spec-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-build
+          
+      - name: Load Environment Variables
+        run: cat .github/config/.env >> $GITHUB_ENV
+          
+      - name: Download Spec Diffs
+        uses: actions/download-artifact@v4
+        with:
+          name: spec-diffs
+          path: spec-diffs
+          
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.build-kit.outputs.version }}
+          name: v${{ needs.build-kit.outputs.version }}
+          body_path: release-notes/${{ env.RELEASE_NOTES_FILE }}
+          files: |
+            *.tar.gz
+            spec-diffs/*
+          # Use workflow dispatch input if available, otherwise use env default
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.release_type == 'pre-release' || env.PRERELEASE }}
+          discussion_category_name: Releases
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.release_type == 'none' }}
+          
+      - name: Notify Success
+        if: success()
+        uses: ./.github/actions/notify
+        with:
+          message: |
+            Successfully released v${{ needs.build-kit.outputs.version }}
+            Previous version: v${{ needs.build-kit.outputs.previous_version }}
+            Type: ${{ github.event_name == 'workflow_dispatch' && inputs.release_type || 'release' }}
+            ${{ needs.spec-check.outputs.has_breaking_changes == 'true' && '⚠️ Contains breaking changes!' || '' }}
+          status: success
